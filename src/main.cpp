@@ -1,12 +1,6 @@
 #include <kc/core/Log.h>
 #include <kc/core/Profiler.h>
-
-// #define CL_HPP_ENABLE_EXCEPTIONS
-// #define CL_HPP_TARGET_OPENCL_VERSION 210
-
-#define __CL_ENABLE_EXCEPTIONS
-
-#include <CL/cl2.hpp>
+#include <kc/parallel/All.h>
 
 void showDeviceInfo(const cl::Device& device) {
     LOG_INFO("Vendor: {}, Vendor ID: {}, Version: {}", device.getInfo<CL_DEVICE_VENDOR>(),
@@ -18,19 +12,11 @@ int main() {
     kc::core::Profiler profiler;
     kc::core::FileSystem fs;
 
-    std::vector<cl::Platform> platforms;
-    cl::Platform::get(&platforms);
+    kc::parallel::Context context;
 
-    std::vector<cl::Device> devices;
-    platforms[0].getDevices(CL_DEVICE_TYPE_ALL, &devices);
+    context.init();
 
-    ASSERT(devices.size() > 0, "Could not find any device that support opencl");
-
-    for (auto& device : devices) showDeviceInfo(device);
-
-    auto& device = devices.front();
-
-    constexpr int length = 1000 * 1000;
+    constexpr int length = 1000;
 
     std::vector<float> a, b, c;
 
@@ -53,30 +39,41 @@ int main() {
 
                 try {
                     static const std::string kernelFile = "../src/kernels/kernel.cl";
-                    auto kernelSource = fs.readFile(kernelFile);
 
-                    cl::Context context(device);
+                    cl::CommandQueue queue(context.get());
 
-                    cl::Program program{context, kernelSource, true};
-                    cl::CommandQueue queue(context);
-                    cl::Buffer dA(context, a.begin(), a.end(), true);
-                    cl::Buffer dB(context, b.begin(), b.end(), true);
-                    cl::Buffer dC(context, CL_MEM_WRITE_ONLY, sizeof(float) * length);
+                    kc::parallel::Buffer<float> dA(length, kc::parallel::BufferType::readOnly,
+                                                   context);
+
+                    dA.fill(3).bind();
+
+                    kc::parallel::Buffer<float> dB(length, kc::parallel::BufferType::readOnly,
+                                                   context);
+                    dB.fill(5).bind();
+
+                    kc::parallel::Buffer<float> dC(length, kc::parallel::BufferType::writeOnly,
+                                                   context);
+                    dC.bind();
+
+                    auto kernel =
+                        kc::parallel::Kernel<cl::Buffer, cl::Buffer, cl::Buffer>::fromFile(
+                            context, kernelFile, "vadd");
 
                     {
                         PROFILE_REGION(parallelRunKernelOnly);
 
-                        cl::KernelFunctor<cl::Buffer, cl::Buffer, cl::Buffer> kernel(program,
-                                                                                     "vadd");
-
-                        kernel(cl::EnqueueArgs(queue, cl::NDRange(length)), dA, dB, dC);
-                        cl::copy(queue, dC, c.begin(), c.end());
+                        kernel.get()(cl::EnqueueArgs(queue, cl::NDRange(length)), dA.get(),
+                                     dB.get(), dC.get());
                     }
+
+                    dC.readValuesFromGpu(queue);
+
+                    for (auto& cc : dC)
+                        ASSERT(cc == 8, "invalid value for parallel run: " + std::to_string(cc));
 
                 } catch (std::exception& e) {
                     LOG_FATAL("{}", e.what());
                 }
-                for (auto& cc : c) ASSERT(cc == 8, "invalid value for parallel run");
             }
         };
 
